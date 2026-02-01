@@ -12,4 +12,4 @@ The Solution will be developed in parallel across three possible devices...
 *  SIM8000L is limited to 2G network areas which are being phased out across the UK
 
 ## Problem statement
-Sugar Beet Crop growth needs to be frequently monitored from drilling (planting) to 12 true leaves (adolecence).  This requires a physical visit to the field on a frequent basis to observe and photograph the development stage.  At the same time Leaf Area index and ground coverge are recorded using the [Canopeo](https://canopeoapp.com/) app.
+Sugar Beet crop growth needs to be frequently monitored from drilling (planting) to 12 true leaves (adolecence).  This requires a physical visit to the field on a frequent basis to observe and photograph the development stage.  At the same time Leaf Area index and ground coverage are recorded using the [Canopeo](https://canopeoapp.com/) app.
