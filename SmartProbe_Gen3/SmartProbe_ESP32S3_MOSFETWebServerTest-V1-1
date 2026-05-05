@@ -1,0 +1,878 @@
+/*================================================================================================================//
+//  Project:     Timelapse Probe — MOSFET + Web Server Diagnostic                                                 //
+//  Hardware:    ESP32-S3FH4R2 SuperMini                                                                          //
+//  Sensors:     BH1750FVI (lux), BMP180 (temp/pressure/altitude),                                                //
+//               Capacitive Soil Moisture, Battery voltage divider                                                //
+//  LED:         WS2812B NeoPixel on GPIO 2  (switched via MOSFET rail)                                           //
+//  Version:     V1-1                                                                                             //
+//================================================================================================================//
+//  Sensors and NeoPixel switched via MOSFET, WiFi + web server start once at boot and stay up permanently.       //
+//  Best-practice design choices
+//    ▸ Brownout detector disabled at boot
+//    ▸ Battery voltage read BEFORE MOSFET on — unloaded, clean reading
+//    ▸ analogReadMilliVolts() + oversampling for battery and soil ADC
+//    ▸ Sea-level pressure computed via computeSeaLevelPressure() + SITE_ALTITUDE_M
+//    ▸ BMP180 station pressure exposed alongside SLP in JSON and dashboard
+//    ▸ BMP180 validity range matches master (50000–115000 Pa)
+//    ▸ Soil ADC with SOIL_ADC_DRY / SOIL_ADC_WET calibration + SOIL_SAMPLES oversampling
+//----------------------------------------------------------------------------------------------------------------//
+//  **Cycle sequence**:                                                                                           //
+//    SENSOR_TEST  → read all sensors every 2 s for 30 s                                                          //
+//    EXTENDED     → continue reading for another 30 s                                                            //
+//    RAINBOW      → cycle NeoPixel, then transition to SLEEP                                                     //
+//    SLEEP        → MOSFET OFF, sensors off for 30 s, web server stays alive                                     //
+
+//  **Web server**
+//    Port 80      always available:                                                                              //
+//    GET /        HTML dashboard  (auto-refreshes 3 s)                                                           //
+//    GET /data    JSON sensor snapshot                                                                           //
+//    GET /status  JSON system state & phase progress                                                             //
+//  ────────────────────────────────────────────────────────────────────────────────────────────────────────────  //
+//  **HARDWARE WIRING**  (S3 SuperMini — matches TimeLapse_S3)                                                    //
+//  ────────────────────────────────────────────────────────────────────────────────────────────────────────────  //
+//  I2C:                                                                                          //
+//    SDA → GPIO 8   (4.7 kΩ pull-up to 3V3)                                                      //
+//    SCL → GPIO 9   (4.7 kΩ pull-up to 3V3)                                                      //
+//    BH1750 ADDR → GND → I2C address 0x23                                                        //
+//    BMP180 auto-detected    → I2C address 0x77                                                   //
+//  Soil ADC:                                                                                     //
+//    GPIO 1  (ADC1_CH0) — capacitive probe output (0–3.3 V)                                      //
+//    Dry ≈ 3.3 V,  Wet ≈ 1.1 V  (calibrate SOIL_ADC_DRY / SOIL_ADC_WET)                         //
+//  Battery ADC:                                                                                  //
+//    GPIO 3  (ADC1_CH2) — mid-point of 100 kΩ + 100 kΩ divider                                   //
+//    LiPo+ ── 100 kΩ ──┬── 100 kΩ ── GND      Scaling factor 0.5×                                //
+//  MOSFET gate → GPIO 4   HIGH = rail ON (sensors + NeoPixel)                                    //
+//  NeoPixel    → GPIO 2   WS2812B, 1 LED (on MOSFET-switched rail)                               //
+//                                                                                                //
+//  DEPENDENCIES (Arduino Library Manager)                                                        //
+//    BH1750                 — Christopher Laws                                                   //
+//    Adafruit BMP085        — Adafruit  (covers BMP180, same register set)                       //
+//    Adafruit Unified Sensor — Adafruit                                                          //
+//    Adafruit NeoPixel      — Adafruit                                                           //
+//    ESPAsyncWebServer      — me-no-dev  (or mathieucarbou fork)                                 //
+//    AsyncTCP               — me-no-dev                                                          //
+//================================================================================================*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <BH1750.h>
+#include <Adafruit_BMP085.h>
+#include <Adafruit_NeoPixel.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include <math.h>
+
+// ═══════════════════════════════════════════════
+//  BUILD INFO
+// ═══════════════════════════════════════════════
+const char* SKETCH_TITLE   = "SmartProbe WebTest S3";
+const char* SKETCH_VERSION = "V1-2";
+const char  compile_date[] = __DATE__;
+const char  compile_time[] = __TIME__;
+
+// ═══════════════════════════════════════════════
+//  WiFi CREDENTIALS
+// ═══════════════════════════════════════════════
+#define WIFI_SSID   "CI_Tablet#1"
+#define WIFI_PASS   "qlyp9532"
+
+// ═══════════════════════════════════════════════
+//  PIN DEFINITIONS  (matches TimeLapse_S3 V1-2)
+// ═══════════════════════════════════════════════
+#define I2C_SDA          8    // I2C data
+#define I2C_SCL          9    // I2C clock
+#define SOIL_ADC_PIN     1    // ADC1_CH0 — capacitive soil probe
+#define BATT_ADC_PIN     3    // ADC1_CH2 — battery voltage divider mid-point
+#define MOSFET_GATE_PIN  4    // N-ch MOSFET gate: HIGH = rail ON
+#define NEO_PIN          2    // WS2812B data (on MOSFET-switched rail)
+#define NEO_COUNT        1
+
+// ═══════════════════════════════════════════════
+//  I2C ADDRESSES
+// ═══════════════════════════════════════════════
+#define BH1750_ADDR   0x23
+#define BMP180_ADDR   0x77
+
+// ═══════════════════════════════════════════════
+//  TIMING
+// ═══════════════════════════════════════════════
+#define SENSOR_POWER_ON_DELAY_MS  1200   // time for rail + sensors to stabilise
+#define BH1750_SETTLE_MS           180   // high-res continuous mode settle
+#define LOOP_INTERVAL_MS          2000   // sensor read interval
+#define SENSOR_TEST_MS           30000   // active sensor-test window
+#define EXTENDED_MS              30000   // extra awake time after test
+#define RAINBOW_CYCLES               3   // rainbow loops before sleep
+#define SLEEP_MS                 30000   // MOSFET-off duration
+
+// ═══════════════════════════════════════════════
+//  BMP180 — ALTITUDE COMPENSATION
+//  Set to your deployment site altitude in metres.
+//  Matches TimeLapse_S3 constant — keep in sync.
+// ═══════════════════════════════════════════════
+#define SITE_ALTITUDE_M   50.0f   // ← change to your site altitude
+
+// ═══════════════════════════════════════════════
+//  SOIL SENSOR CALIBRATION  (matches TimeLapse_S3)
+//  Measure raw ADC (analogRead, 12-bit) in dry air → SOIL_ADC_DRY
+//  Measure raw ADC fully submerged              → SOIL_ADC_WET
+// ═══════════════════════════════════════════════
+#define SOIL_ADC_DRY    3100   // raw ADC when dry
+#define SOIL_ADC_WET    1200   // raw ADC when saturated
+#define SOIL_SAMPLES      16   // oversampling count
+
+// ═══════════════════════════════════════════════
+//  BATTERY VOLTAGE  (matches TimeLapse_S3)
+//  Two equal 100 kΩ resistors → BATT_DIVIDER_RATIO = 2.0
+// ═══════════════════════════════════════════════
+#define BATT_DIVIDER_RATIO   2.0f
+#define BATT_ADC_SAMPLES       16
+
+#define BATT_FULL_V   4.15f
+#define BATT_LOW_V    3.50f
+#define BATT_CRIT_V   3.20f
+
+// ═══════════════════════════════════════════════
+//  OBJECTS
+// ═══════════════════════════════════════════════
+BH1750            lightMeter;
+Adafruit_BMP085   bmp;
+Adafruit_NeoPixel pixel(NEO_COUNT, NEO_PIN, NEO_GRB + NEO_KHZ800);
+AsyncWebServer    server(80);
+
+// ═══════════════════════════════════════════════
+//  STATE MACHINE
+// ═══════════════════════════════════════════════
+enum State { STATE_SENSOR_TEST, STATE_EXTENDED, STATE_RAINBOW, STATE_SLEEP };
+State    currentState = STATE_SENSOR_TEST;
+uint32_t stateStartMs = 0;
+uint32_t lastSensorMs = 0;
+
+// ═══════════════════════════════════════════════
+//  SENSOR FLAGS + LATEST READINGS
+//  Battery is read before MOSFET on; all others
+//  are read after. Globals persist across loop().
+// ═══════════════════════════════════════════════
+bool    bh1750Found        = false;
+bool    bmp180Found        = false;
+
+float   lastLux            = -1.0f;
+bool    luxOk              = false;
+
+float   lastTempC          =  0.0f;
+float   lastPressStationHPa=  0.0f;   // BMP180 raw station pressure
+float   lastPressSLHPa     =  0.0f;   // sea-level corrected
+float   lastAltM           =  0.0f;
+bool    bmpOk              = false;
+
+int     lastSoilRaw        = -1;
+int     lastSoilPct        = -1;
+bool    soilOk             = false;
+
+float   lastBattV          = -1.0f;
+int     lastBattPct        = -1;
+bool    battOk             = false;
+bool    battLow            = false;
+bool    battCrit           = false;
+
+uint32_t lastReadMs        = 0;
+
+// ═══════════════════════════════════════════════
+//  FORWARD DECLARATIONS
+// ═══════════════════════════════════════════════
+void     setupI2C();
+void     powerOnSensors();
+void     powerOffSensors();
+float    readBatteryVoltage();
+int      battVoltageToPercent(float v);
+float    computeSeaLevelPressure(float stationHPa, float altitudeM);
+void     readBattery();
+void     readSensors();
+void     scanI2C();
+void     runRainbow();
+void     enterSensorTest();
+void     enterExtended();
+void     enterRainbow();
+void     enterSleep();
+String   buildDataJSON();
+String   buildStatusJSON();
+void     startWebServer();
+void     connectWiFi();
+const char* stateName();
+
+// ═══════════════════════════════════════════════
+//  STATE NAME
+// ═══════════════════════════════════════════════
+const char* stateName() {
+  switch (currentState) {
+    case STATE_SENSOR_TEST: return "SENSOR TEST";
+    case STATE_EXTENDED:    return "EXTENDED";
+    case STATE_RAINBOW:     return "RAINBOW";
+    case STATE_SLEEP:       return "SLEEP";
+    default:                return "UNKNOWN";
+  }
+}
+
+// ═══════════════════════════════════════════════
+//  NeoPixel HELPERS
+// ═══════════════════════════════════════════════
+void setPixel(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness = 40) {
+  pixel.setBrightness(brightness);
+  pixel.setPixelColor(0, pixel.Color(r, g, b));
+  pixel.show();
+}
+
+void setPixelHue(uint8_t hue, uint8_t brightness = 60) {
+  pixel.setBrightness(brightness);
+  pixel.setPixelColor(0, pixel.ColorHSV(hue * 256, 255, 255));
+  pixel.show();
+}
+
+// ═══════════════════════════════════════════════
+//  SEA-LEVEL PRESSURE CONVERSION  (matches TimeLapse_S3)
+//  P0 = P_station / (1 - altitude / 44330) ^ 5.255
+// ═══════════════════════════════════════════════
+float computeSeaLevelPressure(float stationHPa, float altitudeM) {
+  float divisor = powf(1.0f - (altitudeM / 44330.0f), 5.255f);
+  if (divisor < 0.001f) divisor = 0.001f;
+  return stationHPa / divisor;
+}
+
+// ═══════════════════════════════════════════════
+//  BATTERY VOLTAGE
+//  Call BEFORE powerOnSensors() for an unloaded reading.
+//  analogReadMilliVolts() uses ESP32 factory ADC calibration.
+//  Matches TimeLapse_S3 readBatteryVoltage() exactly.
+// ═══════════════════════════════════════════════
+float readBatteryVoltage() {
+  pinMode(BATT_ADC_PIN, INPUT);
+  delay(5);
+
+  uint32_t sumMv = 0;
+  for (int i = 0; i < BATT_ADC_SAMPLES; i++) {
+    sumMv += analogReadMilliVolts(BATT_ADC_PIN);
+    delay(2);
+  }
+  float adcMv  = (float)(sumMv / BATT_ADC_SAMPLES);
+  float battV  = (adcMv * BATT_DIVIDER_RATIO) / 1000.0f;
+  Serial.printf("[Batt] ADC=%.1f mV  Battery=%.3f V\n", adcMv, battV);
+  return battV;
+}
+
+int battVoltageToPercent(float v) {
+  const float V_MAX = 4.20f;
+  const float V_MIN = 3.00f;
+  int pct = (int)(((v - V_MIN) / (V_MAX - V_MIN)) * 100.0f + 0.5f);
+  return constrain(pct, 0, 100);
+}
+
+// Convenience wrapper — updates all battery globals
+void readBattery() {
+  lastBattV    = readBatteryVoltage();
+  lastBattPct  = battVoltageToPercent(lastBattV);
+  battOk       = (lastBattV >= 2.5f && lastBattV <= 4.4f);
+  battLow      = (lastBattV < BATT_LOW_V  && lastBattV > 1.0f);
+  battCrit     = (lastBattV < BATT_CRIT_V && lastBattV > 1.0f);
+  Serial.printf("[Batt] %.3f V  %d%%  %s\n",
+                lastBattV, lastBattPct,
+                battCrit ? "CRITICAL" : battLow ? "LOW" : "OK");
+}
+
+// ═══════════════════════════════════════════════
+//  I2C SETUP  (matches TimeLapse_S3 setupI2C())
+// ═══════════════════════════════════════════════
+void setupI2C() {
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);
+  Serial.printf("[I2C] SDA=GPIO%d  SCL=GPIO%d  400 kHz\n", I2C_SDA, I2C_SCL);
+}
+
+// ═══════════════════════════════════════════════
+//  I2C BUS SCANNER
+// ═══════════════════════════════════════════════
+void scanI2C() {
+  Serial.println("[I2C Scan] Scanning 0x01–0x7F ...");
+  int found = 0;
+  for (uint8_t addr = 0x01; addr < 0x7F; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("  Found 0x%02X", addr);
+      if (addr == BH1750_ADDR) Serial.print("  ← BH1750FVI");
+      if (addr == BMP180_ADDR) Serial.print("  ← BMP180");
+      Serial.println();
+      found++;
+    }
+  }
+  Serial.printf("[I2C Scan] %d device(s) found.\n\n", found);
+}
+
+// ═══════════════════════════════════════════════
+//  SENSOR POWER ON
+//  Called AFTER readBattery() so MOSFET was still
+//  low during the battery measurement.
+// ═══════════════════════════════════════════════
+void powerOnSensors() {
+  Serial.println("[MOSFET] GPIO4 HIGH — sensors + NeoPixel ON");
+  digitalWrite(MOSFET_GATE_PIN, HIGH);
+  delay(SENSOR_POWER_ON_DELAY_MS);   // allow rail to stabilise + sensors to boot
+
+  pixel.begin();
+  setPixel(0, 0, 255);   // blue = booting
+
+  setupI2C();
+  scanI2C();
+
+  bh1750Found = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE_2, BH1750_ADDR, &Wire);
+  Serial.printf("[BH1750] Init: %s\n", bh1750Found ? "OK" : "FAILED");
+
+  bmp180Found = bmp.begin();
+  Serial.printf("[BMP180] Init: %s\n", bmp180Found ? "OK" : "FAILED");
+
+  if (!bh1750Found && !bmp180Found) {
+    Serial.println("[ERROR] Both sensors missing — check wiring and pull-ups");
+    setPixel(255, 0, 0);
+  } else if (bh1750Found && bmp180Found) {
+    Serial.println("[OK] Both sensors found.");
+    setPixel(0, 255, 0);
+  } else {
+    Serial.println("[WARN] Only one sensor found.");
+    setPixel(255, 180, 0);
+  }
+
+  delay(BH1750_SETTLE_MS);   // continuous mode settle
+}
+
+// ═══════════════════════════════════════════════
+//  SENSOR POWER OFF
+// ═══════════════════════════════════════════════
+void powerOffSensors() {
+  setPixel(0, 0, 0, 0);
+  delay(10);
+  Wire.end();
+  Serial.printf("[MOSFET] GPIO4 LOW — sensors + NeoPixel OFF for %d s\n",
+                SLEEP_MS / 1000);
+  digitalWrite(MOSFET_GATE_PIN, LOW);
+}
+
+// ═══════════════════════════════════════════════
+//  READ ALL SENSORS
+//  BH1750 — continuous mode, no extra settle needed.
+//  BMP180 — station pressure validated 500–1150 hPa.
+//            sea-level pressure computed from SITE_ALTITUDE_M.
+//  Soil   — 16-sample oversample with analogReadMilliVolts()
+//            converted to raw 12-bit equivalent for map().
+// ═══════════════════════════════════════════════
+void readSensors() {
+  luxOk = false;
+  bmpOk = false;
+  soilOk = false;
+
+  // ── BH1750 ───────────────────────────────────
+  if (bh1750Found) {
+    lastLux = lightMeter.readLightLevel();
+    luxOk   = (lastLux >= 0.0f);
+    if (luxOk) Serial.printf("[BH1750] %.2f lx\n", lastLux);
+    else        Serial.println("[BH1750] Read error");
+  } else {
+    Serial.println("[BH1750] NOT FOUND");
+  }
+
+  // ── BMP180 ───────────────────────────────────
+  if (bmp180Found) {
+    lastTempC             = bmp.readTemperature();
+    float rawPa           = bmp.readPressure();        // Pascals, station pressure
+    lastPressStationHPa   = rawPa / 100.0f;            // convert to hPa
+    lastAltM              = bmp.readAltitude();        // uses last known sea-level ref
+    lastPressSLHPa        = computeSeaLevelPressure(lastPressStationHPa, SITE_ALTITUDE_M);
+
+    // Validate raw Pascals: same range check as TimeLapse_S3
+    bmpOk = (rawPa > 50000.0f && rawPa < 115000.0f);
+    if (bmpOk) {
+      Serial.printf("[BMP180] Temp=%.1f°C  Station=%.2f hPa  SeaLevel=%.2f hPa  Alt=%.0f m\n",
+                    lastTempC, lastPressStationHPa, lastPressSLHPa, lastAltM);
+    } else {
+      Serial.println("[BMP180] Read error — pressure out of valid range");
+    }
+  } else {
+    Serial.println("[BMP180] NOT FOUND");
+  }
+
+  // ── Capacitive Soil Moisture ──────────────────
+  // analogReadMilliVolts with oversampling, then scale to equivalent 12-bit raw.
+  // map() uses the same SOIL_ADC_DRY / SOIL_ADC_WET as TimeLapse_S3.
+  {
+    uint32_t sumMv = 0;
+    for (int i = 0; i < SOIL_SAMPLES; i++) {
+      sumMv += analogReadMilliVolts(SOIL_ADC_PIN);
+      delay(2);
+    }
+    float avgMv   = (float)(sumMv / SOIL_SAMPLES);
+    // Convert mV → 12-bit raw equivalent  (3300 mV = 4095)
+    lastSoilRaw   = (int)((avgMv / 3300.0f) * 4095.0f + 0.5f);
+    lastSoilPct   = constrain(
+      map(lastSoilRaw, SOIL_ADC_DRY, SOIL_ADC_WET, 0, 100), 0, 100);
+    soilOk        = true;
+    Serial.printf("[Soil] Raw=%d (%.1f mV)  Moisture=%d%%\n",
+                  lastSoilRaw, avgMv, lastSoilPct);
+  }
+
+  lastReadMs = millis();
+
+  // Update NeoPixel: green = all OK, yellow = partial, red = all failed
+  if      ( luxOk &&  bmpOk) setPixel(0,   255, 0  );
+  else if (!luxOk && !bmpOk) setPixel(255, 0,   0  );
+  else                        setPixel(255, 180, 0  );
+
+  Serial.println("--------------------------------------------");
+}
+
+// ═══════════════════════════════════════════════
+//  WiFi — connect once at boot, stays up
+// ═══════════════════════════════════════════════
+void connectWiFi() {
+  Serial.printf("[WiFi] Connecting to %s", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  uint32_t t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) {
+    delay(500); Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n[WiFi] Connected — IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("[WiFi] Dashboard  → http://%s/\n\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("\n[WiFi] Failed — running without network.");
+  }
+}
+
+// ═══════════════════════════════════════════════
+//  HTML DASHBOARD
+//  Cards: Lux, Temp, Station Pressure, Sea-Level Pressure,
+//         Altitude, Soil Moisture, Battery Voltage, Battery %
+// ═══════════════════════════════════════════════
+const char HTML_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SmartProbe Diagnostic</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Syne:wght@600;800&display=swap');
+  :root {
+    --bg:#090c12;--surface:#111620;--border:#1e2535;
+    --accent:#00e5c3;--accent2:#ff6b35;--accent3:#a78bfa;
+    --green:#22d3a5;--yellow:#f59e0b;--red:#ef4444;--blue:#60a5fa;
+    --text:#e2e8f0;--sub:#5a7090;--mono:'JetBrains Mono',monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:'Syne',sans-serif;
+    min-height:100vh;padding:28px 24px;
+    background-image:radial-gradient(ellipse at 20% 0%,rgba(0,229,195,.06) 0%,transparent 60%),
+                     radial-gradient(ellipse at 80% 100%,rgba(167,139,250,.05) 0%,transparent 60%)}
+  h1{font-size:1.6rem;font-weight:800;letter-spacing:-.02em;
+     background:linear-gradient(90deg,var(--accent),var(--accent3));
+     -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+  .subtitle{color:var(--sub);font-size:.72rem;font-family:var(--mono);
+    margin-top:4px;margin-bottom:28px;letter-spacing:.04em}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;
+    padding:18px 20px;position:relative;overflow:hidden;transition:border-color .2s}
+  .card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
+    background:linear-gradient(90deg,var(--accent),transparent);opacity:.5}
+  .card:hover{border-color:rgba(0,229,195,.25)}
+  .card-label{font-size:.64rem;font-family:var(--mono);text-transform:uppercase;
+    letter-spacing:.12em;color:var(--sub);margin-bottom:10px}
+  .card-value{font-size:2rem;font-weight:800;line-height:1;font-family:var(--mono);
+    color:var(--text)}
+  .card-unit{font-size:.7rem;font-family:var(--mono);color:var(--sub);margin-top:5px}
+  .card.warn .card-value{color:var(--yellow)}
+  .card.crit .card-value{color:var(--red)}
+  .status-bar{display:flex;align-items:center;gap:12px;margin-top:16px;
+    background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 18px}
+  .dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;transition:background .3s,box-shadow .3s}
+  .dot.green {background:var(--green); box-shadow:0 0 10px var(--green)}
+  .dot.yellow{background:var(--yellow);box-shadow:0 0 10px var(--yellow)}
+  .dot.red   {background:var(--red);   box-shadow:0 0 10px var(--red)}
+  .dot.blue  {background:var(--blue);  box-shadow:0 0 10px var(--blue)}
+  .dot.grey  {background:#2a3548}
+  .status-text{font-size:.8rem;flex:1}
+  .badge{margin-left:auto;font-size:.65rem;font-family:var(--mono);padding:4px 10px;
+    border-radius:4px;background:#1a2235;border:1px solid var(--border);color:var(--sub)}
+  .progress-wrap{margin-top:14px}
+  .progress-label{display:flex;justify-content:space-between;font-size:.68rem;
+    font-family:var(--mono);color:var(--sub);margin-bottom:6px}
+  .progress-track{background:#111620;border-radius:99px;height:4px;overflow:hidden;
+    border:1px solid var(--border)}
+  .progress-fill{height:100%;border-radius:99px;
+    background:linear-gradient(90deg,var(--accent),var(--accent3));
+    transition:width .5s cubic-bezier(.4,0,.2,1)}
+  .sleep-notice{display:none;margin-top:14px;background:rgba(10,15,25,.8);
+    border:1px solid var(--border);border-radius:10px;padding:14px 18px;
+    font-size:.78rem;font-family:var(--mono);color:var(--sub);text-align:center}
+  .divider{height:1px;background:var(--border);margin:20px 0}
+  .sensor-flags{display:flex;gap:16px;margin-top:8px}
+  .flag{font-size:.65rem;font-family:var(--mono);padding:3px 8px;border-radius:3px;
+    border:1px solid var(--border)}
+  .flag.ok{border-color:rgba(34,211,165,.4);color:var(--green)}
+  .flag.fail{border-color:rgba(239,68,68,.4);color:var(--red)}
+  .footer{margin-top:22px;font-size:.64rem;font-family:var(--mono);
+    color:var(--sub);display:flex;gap:16px;flex-wrap:wrap;align-items:center}
+  .footer a{color:var(--accent);text-decoration:none}
+  .footer a:hover{text-decoration:underline}
+  #updated{color:var(--sub);font-size:.64rem;font-family:var(--mono)}
+</style>
+</head>
+<body>
+<h1>SmartProbe Diagnostic</h1>
+<p class="subtitle" id="updated">connecting...</p>
+
+<div class="grid">
+  <div class="card" id="card-lux">
+    <div class="card-label">&#x2600; Light Level</div>
+    <div class="card-value" id="lux">—</div>
+    <div class="card-unit">lux · BH1750FVI</div>
+  </div>
+  <div class="card" id="card-temp">
+    <div class="card-label">&#x1F321; Temperature</div>
+    <div class="card-value" id="temp">—</div>
+    <div class="card-unit">°C · BMP180</div>
+  </div>
+  <div class="card" id="card-press-station">
+    <div class="card-label">&#x1F4A8; Station Pressure</div>
+    <div class="card-value" id="press-station">—</div>
+    <div class="card-unit">hPa · raw</div>
+  </div>
+  <div class="card" id="card-press-sl">
+    <div class="card-label">&#x1F30D; Sea-Level Pressure</div>
+    <div class="card-value" id="press-sl">—</div>
+    <div class="card-unit">hPa · corrected</div>
+  </div>
+  <div class="card" id="card-alt">
+    <div class="card-label">&#x26F0; Altitude</div>
+    <div class="card-value" id="alt">—</div>
+    <div class="card-unit">metres</div>
+  </div>
+  <div class="card" id="card-soil">
+    <div class="card-label">&#x1F331; Soil Moisture</div>
+    <div class="card-value" id="soil">—</div>
+    <div class="card-unit">% · capacitive</div>
+  </div>
+  <div class="card" id="card-battv">
+    <div class="card-label">&#x1F50B; Battery Voltage</div>
+    <div class="card-value" id="battv">—</div>
+    <div class="card-unit">V · divider × 2</div>
+  </div>
+  <div class="card" id="card-battp">
+    <div class="card-label">&#x26A1; Battery Level</div>
+    <div class="card-value" id="battp">—</div>
+    <div class="card-unit">% · 3.0–4.2 V range</div>
+  </div>
+</div>
+
+<div class="status-bar">
+  <div class="dot grey" id="dot"></div>
+  <div class="status-text">
+    <div id="status-text">—</div>
+    <div class="sensor-flags" id="sensor-flags"></div>
+  </div>
+  <div class="badge" id="state-badge">—</div>
+</div>
+
+<div class="progress-wrap">
+  <div class="progress-label">
+    <span id="phase-label">Phase progress</span>
+    <span id="phase-pct">—</span>
+  </div>
+  <div class="progress-track">
+    <div class="progress-fill" id="progress-fill" style="width:0%"></div>
+  </div>
+</div>
+
+<div class="sleep-notice" id="sleep-notice">
+  &#x1F4A4;&nbsp; MOSFET rail OFF — sensors and NeoPixel powered down.<br>
+  Web server remains active. Next cycle starts shortly.
+</div>
+
+<div class="divider"></div>
+<div class="footer">
+  <span id="updated-footer">Auto-refreshes every 3 s</span>
+  <a href="/data">JSON /data</a>
+  <a href="/status">JSON /status</a>
+</div>
+
+<script>
+async function refresh(){
+  try{
+    const[dRes,sRes]=await Promise.all([fetch('/data'),fetch('/status')]);
+    const d=await dRes.json(),s=await sRes.json();
+    const sleeping=s.state==='SLEEP'||s.state==='RAINBOW';
+    const na=v=>sleeping?'--':(v!=null?v:'N/A');
+
+    document.getElementById('lux').textContent         =d.lux_ok        ?d.lux.toFixed(1)               :na(null);
+    document.getElementById('temp').textContent        =d.bmp_ok        ?d.temp_c.toFixed(1)             :na(null);
+    document.getElementById('press-station').textContent=d.bmp_ok       ?d.pressure_station_hpa.toFixed(1):na(null);
+    document.getElementById('press-sl').textContent   =d.bmp_ok        ?d.pressure_sl_hpa.toFixed(1)    :na(null);
+    document.getElementById('alt').textContent         =d.bmp_ok        ?d.altitude_m.toFixed(0)         :na(null);
+    document.getElementById('soil').textContent        =d.soil_ok       ?d.soil_pct                      :na(null);
+    document.getElementById('battv').textContent       =d.batt_ok       ?d.batt_v.toFixed(3)             :'—';
+    document.getElementById('battp').textContent       =d.batt_ok       ?d.batt_pct+'%'                  :'—';
+
+    // Battery card colouring
+    const cv=document.getElementById('card-battv');
+    const cp=document.getElementById('card-battp');
+    cv.className=cp.className='card'+(d.batt_crit?' crit':d.batt_low?' warn':'');
+
+    // Status dot
+    const dot=document.getElementById('dot');
+    let dotClass='grey',statusText='Sensors powered off';
+    if(!sleeping){
+      const c=d.led_colour;
+      dotClass=c==='GREEN'?'green':c==='YELLOW'?'yellow':c==='RED'?'red':'blue';
+      const s2=c==='GREEN'?'All sensors OK':c==='RED'?'Both sensors failed':'One sensor failed';
+      statusText=s2+(d.batt_crit?' &mdash; ⚠ BATTERY CRITICAL':d.batt_low?' &mdash; ⚠ Battery low':'');
+    }
+    dot.className='dot '+dotClass;
+    document.getElementById('status-text').innerHTML=statusText;
+
+    document.getElementById('sensor-flags').innerHTML=
+      '<span class="flag '+(d.bh1750_found?'ok':'fail')+'">BH1750 '+(d.bh1750_found?'✓':'✗')+'</span>'+
+      '<span class="flag '+(d.bmp180_found?'ok':'fail')+'">BMP180 '+(d.bmp180_found?'✓':'✗')+'</span>'+
+      '<span class="flag '+(d.batt_ok?'ok':'fail')+'">BATT '+(d.batt_ok?'✓':'✗')+'</span>';
+
+    document.getElementById('state-badge').textContent=s.state;
+    const pct=s.phase_duration_ms>0
+      ?Math.min(100,Math.round(s.phase_elapsed_ms/s.phase_duration_ms*100)):0;
+    document.getElementById('progress-fill').style.width=pct+'%';
+    document.getElementById('phase-label').textContent=s.state+' phase';
+    document.getElementById('phase-pct').textContent=pct+'%';
+    document.getElementById('sleep-notice').style.display=sleeping?'block':'none';
+
+    const ts=new Date().toLocaleTimeString();
+    const net=s.ip?'  ·  '+s.ip:''+(s.rssi?'  ·  '+s.rssi+' dBm':'');
+    document.getElementById('updated').textContent=ts+net;
+    document.getElementById('updated-footer').textContent='Last updated: '+ts+(s.ip?'  ·  IP: '+s.ip:'')+(s.rssi?'  ·  RSSI: '+s.rssi+' dBm':'');
+  } catch(e){
+    document.getElementById('updated').textContent='Connection error — retrying...';
+  }
+}
+refresh();
+setInterval(refresh,3000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ═══════════════════════════════════════════════
+//  JSON BUILDERS
+// ═══════════════════════════════════════════════
+String buildDataJSON() {
+  const char* colour = "OFF";
+  if (currentState == STATE_SENSOR_TEST || currentState == STATE_EXTENDED) {
+    if      ( luxOk &&  bmpOk) colour = "GREEN";
+    else if (!luxOk && !bmpOk) colour = "RED";
+    else                        colour = "YELLOW";
+  }
+  char buf[640];
+  snprintf(buf, sizeof(buf),
+    "{"
+      "\"lux\":%.2f,"
+      "\"lux_ok\":%s,"
+      "\"temp_c\":%.1f,"
+      "\"pressure_station_hpa\":%.2f,"
+      "\"pressure_sl_hpa\":%.2f,"
+      "\"altitude_m\":%.1f,"
+      "\"bmp_ok\":%s,"
+      "\"soil_raw\":%d,"
+      "\"soil_pct\":%d,"
+      "\"soil_ok\":%s,"
+      "\"batt_v\":%.3f,"
+      "\"batt_pct\":%d,"
+      "\"batt_ok\":%s,"
+      "\"batt_low\":%s,"
+      "\"batt_crit\":%s,"
+      "\"bh1750_found\":%s,"
+      "\"bmp180_found\":%s,"
+      "\"led_colour\":\"%s\","
+      "\"sensors_powered\":%s,"
+      "\"last_read_ms\":%lu"
+    "}",
+    lastLux,              luxOk       ? "true" : "false",
+    lastTempC,            lastPressStationHPa,
+    lastPressSLHPa,       lastAltM,
+    bmpOk               ? "true" : "false",
+    lastSoilRaw,          lastSoilPct,
+    soilOk              ? "true" : "false",
+    lastBattV,            lastBattPct,
+    battOk              ? "true" : "false",
+    battLow             ? "true" : "false",
+    battCrit            ? "true" : "false",
+    bh1750Found         ? "true" : "false",
+    bmp180Found         ? "true" : "false",
+    colour,
+    (currentState != STATE_SLEEP) ? "true" : "false",
+    lastReadMs
+  );
+  return String(buf);
+}
+
+String buildStatusJSON() {
+  uint32_t elapsed  = millis() - stateStartMs;
+  uint32_t duration = 1;
+  switch (currentState) {
+    case STATE_SENSOR_TEST: duration = SENSOR_TEST_MS; break;
+    case STATE_EXTENDED:    duration = EXTENDED_MS;    break;
+    case STATE_SLEEP:       duration = SLEEP_MS;       break;
+    default: break;
+  }
+  char buf[256];
+  snprintf(buf, sizeof(buf),
+    "{"
+      "\"state\":\"%s\","
+      "\"uptime_ms\":%lu,"
+      "\"phase_elapsed_ms\":%lu,"
+      "\"phase_duration_ms\":%lu,"
+      "\"ip\":\"%s\","
+      "\"rssi\":%d"
+    "}",
+    stateName(), millis(), elapsed, duration,
+    WiFi.localIP().toString().c_str(),
+    WiFi.RSSI()
+  );
+  return String(buf);
+}
+
+// ═══════════════════════════════════════════════
+//  WEB SERVER — started once, never stopped
+// ═══════════════════════════════════════════════
+void startWebServer() {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
+    req->send_P(200, "text/html", HTML_PAGE);
+  });
+  server.on("/data", HTTP_GET, [](AsyncWebServerRequest* req) {
+    req->send(200, "application/json", buildDataJSON());
+  });
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest* req) {
+    req->send(200, "application/json", buildStatusJSON());
+  });
+  server.onNotFound([](AsyncWebServerRequest* req) {
+    req->send(404, "text/plain", "Not found");
+  });
+  server.begin();
+  Serial.println("[Web] Server started on port 80 — stays up permanently.");
+}
+
+// ═══════════════════════════════════════════════
+//  RAINBOW  (blocking — short duration)
+// ═══════════════════════════════════════════════
+void runRainbow() {
+  Serial.printf("[Rainbow] %d cycle(s)...\n", RAINBOW_CYCLES);
+  for (int c = 0; c < RAINBOW_CYCLES; c++)
+    for (int hue = 0; hue < 256; hue++) {
+      setPixelHue((uint8_t)hue, 60);
+      delay(10);
+    }
+  Serial.println("[Rainbow] Done.");
+}
+
+// ═══════════════════════════════════════════════
+//  STATE TRANSITIONS
+// ═══════════════════════════════════════════════
+void enterSensorTest() {
+  Serial.printf("\n== STATE: SENSOR TEST (%d s) ==\n", SENSOR_TEST_MS / 1000);
+  // Battery is read BEFORE powerOnSensors() — unloaded reading
+  readBattery();
+  powerOnSensors();
+  currentState = STATE_SENSOR_TEST;
+  stateStartMs = millis();
+  lastSensorMs = millis() - LOOP_INTERVAL_MS;   // trigger first read immediately
+}
+
+void enterExtended() {
+  Serial.printf("\n== STATE: EXTENDED (%d s) ==\n", EXTENDED_MS / 1000);
+  currentState = STATE_EXTENDED;
+  stateStartMs = millis();
+}
+
+void enterSleep() {
+  Serial.printf("\n== STATE: SLEEP (%d s) ==\n", SLEEP_MS / 1000);
+  currentState = STATE_SLEEP;
+  stateStartMs = millis();
+  powerOffSensors();
+}
+
+void enterRainbow() {
+  Serial.println("\n== STATE: RAINBOW ==");
+  currentState = STATE_RAINBOW;
+  runRainbow();
+  enterSleep();   // MOSFET off immediately after rainbow
+}
+
+// ═══════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════
+void setup() {
+  // Disable brownout detector — prevents spurious resets during MOSFET switching
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  // ── GPIO init ────────────────────────────────
+  digitalWrite(MOSFET_GATE_PIN, LOW);
+  pinMode(MOSFET_GATE_PIN, OUTPUT);
+
+  // ── Serial ───────────────────────────────────
+  Serial.begin(115200);
+  delay(400);
+  Serial.println("========================================");
+  Serial.printf( "  %s  %s\n", SKETCH_TITLE, SKETCH_VERSION);
+  Serial.printf( "  Compiled: %s %s\n", compile_date, compile_time);
+  Serial.println("  BH1750FVI + BMP180 + Soil + Battery");
+  Serial.println("  MOSFET GPIO4  |  NeoPixel GPIO2");
+  Serial.println("  Web server :80  |  WiFi persistent");
+  Serial.println("========================================\n");
+
+  // ── WiFi + web server start once ─────────────
+  connectWiFi();
+  startWebServer();
+
+  // ── First sensor cycle ────────────────────────
+  // enterSensorTest() calls readBattery() before MOSFET on
+  enterSensorTest();
+}
+
+// ═══════════════════════════════════════════════
+//  LOOP
+// ═══════════════════════════════════════════════
+void loop() {
+  uint32_t now = millis();
+
+  switch (currentState) {
+
+    case STATE_SENSOR_TEST:
+      if (now - lastSensorMs >= LOOP_INTERVAL_MS) {
+        lastSensorMs = now;
+        readSensors();
+      }
+      if (now - stateStartMs >= SENSOR_TEST_MS) enterExtended();
+      break;
+
+    case STATE_EXTENDED:
+      if (now - lastSensorMs >= LOOP_INTERVAL_MS) {
+        lastSensorMs = now;
+        readSensors();
+      }
+      if (now - stateStartMs >= EXTENDED_MS) enterRainbow();
+      break;
+
+    case STATE_SLEEP:
+      if (now - stateStartMs >= SLEEP_MS) {
+        Serial.println("\n== Restarting cycle ==");
+        enterSensorTest();
+      }
+      break;
+
+    case STATE_RAINBOW:   // blocking — handled inside enterRainbow()
+    default:
+      break;
+  }
+}
